@@ -86,12 +86,13 @@ fn use_fancy_terminal() -> bool {
 
 #[cfg(windows)]
 fn use_fancy_terminal() -> bool {
-    unsafe {
-        let handle = winapi::um::processenv::GetStdHandle(winapi::um::winbase::STD_OUTPUT_HANDLE);
-        let mut out = 0;
-        // Note: GetConsoleMode itself fails when not attached to a console.
-        winapi::um::consoleapi::GetConsoleMode(handle, &mut out) != 0
-    }
+    use windows_sys::Win32::System::Console::{GetConsoleMode, GetStdHandle, STD_OUTPUT_HANDLE};
+
+    let handle = unsafe { GetStdHandle(STD_OUTPUT_HANDLE) };
+    let mut out = 0;
+    // Note: GetConsoleMode itself fails when not attached to a console.
+    let console_mode = unsafe { GetConsoleMode(handle, &mut out) };
+    console_mode != 0
 }
 
 fn run_impl() -> anyhow::Result<i32> {

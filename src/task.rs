@@ -21,9 +21,6 @@ use std::os::unix::process::ExitStatusExt;
 #[cfg(unix)]
 use std::sync::Mutex;
 
-#[cfg(windows)]
-extern crate winapi;
-
 pub struct FinishedTask {
     /// A (faked) "thread id", used to put different finished builds in different
     /// tracks in a performance trace.
@@ -137,100 +134,138 @@ fn run_command(cmdline: &str) -> anyhow::Result<TaskResult> {
 }
 
 #[cfg(windows)]
-fn zeroed_startupinfo() -> winapi::um::processthreadsapi::STARTUPINFOA {
-    winapi::um::processthreadsapi::STARTUPINFOA {
-        cb: 0,
-        lpReserved: std::ptr::null_mut(),
-        lpDesktop: std::ptr::null_mut(),
-        lpTitle: std::ptr::null_mut(),
-        dwX: 0,
-        dwY: 0,
-        dwXSize: 0,
-        dwYSize: 0,
-        dwXCountChars: 0,
-        dwYCountChars: 0,
-        dwFillAttribute: 0,
-        dwFlags: 0,
-        wShowWindow: 0,
-        cbReserved2: 0,
-        lpReserved2: std::ptr::null_mut(),
-        hStdInput: winapi::um::handleapi::INVALID_HANDLE_VALUE,
-        hStdOutput: winapi::um::handleapi::INVALID_HANDLE_VALUE,
-        hStdError: winapi::um::handleapi::INVALID_HANDLE_VALUE,
-    }
+use windows_sys::Win32::Foundation::HANDLE;
+
+#[cfg(windows)]
+struct Pipe {
+    read: HANDLE,
+    write: HANDLE,
 }
 
 #[cfg(windows)]
-fn zeroed_process_information() -> winapi::um::processthreadsapi::PROCESS_INFORMATION {
-    winapi::um::processthreadsapi::PROCESS_INFORMATION {
-        hProcess: std::ptr::null_mut(),
-        hThread: std::ptr::null_mut(),
-        dwProcessId: 0,
-        dwThreadId: 0,
+fn create_pipe(
+    security_attribs: &windows_sys::Win32::Security::SECURITY_ATTRIBUTES,
+) -> anyhow::Result<Pipe> {
+    use std::{io, mem};
+    use windows_sys::Win32::System::Pipes::CreatePipe;
+
+    let mut stdout_read = mem::MaybeUninit::uninit();
+    let mut stdout_write = mem::MaybeUninit::uninit();
+    let res = unsafe {
+        CreatePipe(
+            stdout_read.as_mut_ptr(),
+            stdout_write.as_mut_ptr(),
+            security_attribs,
+            0,
+        )
+    };
+    if res == 0 {
+        bail!("CreatePipe failed: {}", io::Error::last_os_error());
     }
+
+    Ok(Pipe {
+        read: unsafe { stdout_read.assume_init() },
+        write: unsafe { stdout_write.assume_init() },
+    })
 }
 
 #[cfg(windows)]
 fn run_command(cmdline: &str) -> anyhow::Result<TaskResult> {
+    use std::{
+        fs,
+        io::{self, Read},
+        iter, mem,
+        os::windows::prelude::FromRawHandle,
+        ptr,
+    };
+    use windows_sys::{
+        w,
+        Win32::{
+            Foundation::{CloseHandle, GENERIC_READ, TRUE},
+            Security::SECURITY_ATTRIBUTES,
+            Storage::FileSystem::{
+                CreateFileW, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
+            },
+            System::Threading::{
+                CreateProcessW, GetExitCodeProcess, WaitForSingleObject, INFINITE,
+                STARTF_USESTDHANDLES, STARTUPINFOW,
+            },
+        },
+    };
+
     // Don't want to run `cmd /c` since that limits cmd line length to 8192 bytes.
     // std::process::Command can't take a string and pass it through to CreateProcess unchanged,
     // so call that ourselves.
 
-    // TODO: Set this to just 0 for console pool jobs.
-    let process_flags = winapi::um::winbase::CREATE_NEW_PROCESS_GROUP;
+    let security_attribs = SECURITY_ATTRIBUTES {
+        nLength: mem::size_of::<SECURITY_ATTRIBUTES>() as _,
+        lpSecurityDescriptor: ptr::null_mut(),
+        bInheritHandle: TRUE,
+    };
 
-    let mut startup_info = zeroed_startupinfo();
-    startup_info.cb = std::mem::size_of::<winapi::um::processthreadsapi::STARTUPINFOA>() as u32;
-    startup_info.dwFlags = winapi::um::winbase::STARTF_USESTDHANDLES;
+    let stdout = create_pipe(&security_attribs)?;
+    let stderr = create_pipe(&security_attribs)?;
 
-    let mut process_info = zeroed_process_information();
-
-    let mut mut_cmdline = cmdline.to_string() + "\0";
-
-    let create_process_success = unsafe {
-        winapi::um::processthreadsapi::CreateProcessA(
-            std::ptr::null_mut(),
-            mut_cmdline.as_mut_ptr() as *mut i8,
-            std::ptr::null_mut(),
-            std::ptr::null_mut(),
-            /*inherit handles = */ winapi::shared::ntdef::TRUE.into(),
-            process_flags,
-            std::ptr::null_mut(),
-            std::ptr::null_mut(),
-            &mut startup_info,
-            &mut process_info,
+    let null_file = unsafe {
+        CreateFileW(
+            w!("NUL"),
+            GENERIC_READ,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            &security_attribs,
+            OPEN_EXISTING,
+            0,
+            0,
         )
     };
-    if create_process_success == 0 {
-        // TODO: better error?
-        let error = unsafe { winapi::um::errhandlingapi::GetLastError() };
-        bail!("CreateProcessA failed: {}", error);
+    if null_file == 0 {
+        bail!("CreateFileW failed: {}", io::Error::last_os_error());
     }
 
-    unsafe {
-        winapi::um::handleapi::CloseHandle(process_info.hThread);
+    let mut startup_info = unsafe { mem::zeroed::<STARTUPINFOW>() };
+    startup_info.cb = mem::size_of_val(&startup_info) as u32;
+    startup_info.hStdInput = null_file;
+    startup_info.hStdError = stderr.write;
+    startup_info.hStdOutput = stdout.write;
+    startup_info.dwFlags = STARTF_USESTDHANDLES;
+    let mut process_info = mem::MaybeUninit::uninit();
+    let mut cmdline_wide: Vec<_> = cmdline.encode_utf16().chain(iter::once(0)).collect();
+    let create_process_res = unsafe {
+        CreateProcessW(
+            std::ptr::null(),
+            cmdline_wide.as_mut_ptr(),
+            &security_attribs,
+            std::ptr::null(),
+            TRUE,
+            0,
+            std::ptr::null(),
+            std::ptr::null(),
+            &mut startup_info,
+            process_info.as_mut_ptr(),
+        )
+    };
+    if create_process_res == 0 {
+        bail!("CreateProcessW failed: {}", io::Error::last_os_error());
     }
+    let process_info = unsafe { process_info.assume_init() };
 
     unsafe {
-        winapi::um::synchapi::WaitForSingleObject(
-            process_info.hProcess,
-            winapi::um::winbase::INFINITE,
-        );
+        CloseHandle(stdout.write);
+        CloseHandle(stderr.write);
+        CloseHandle(null_file);
     }
+
+    let mut output = Vec::new();
+    unsafe { fs::File::from_raw_handle(stdout.read as _) }.read_to_end(&mut output)?;
+    unsafe { fs::File::from_raw_handle(stderr.read as _) }.read_to_end(&mut output)?;
 
     let mut exit_code: u32 = 0;
     unsafe {
-        winapi::um::processthreadsapi::GetExitCodeProcess(process_info.hProcess, &mut exit_code);
+        WaitForSingleObject(process_info.hProcess, INFINITE);
+        GetExitCodeProcess(process_info.hProcess, &mut exit_code);
+        CloseHandle(process_info.hProcess);
+        CloseHandle(process_info.hThread);
     }
 
-    unsafe {
-        winapi::um::handleapi::CloseHandle(process_info.hProcess);
-    }
-
-    let output = Vec::new();
-    // TODO: Set up pipes so that we can print the process's output.
-    //output.append(&mut cmd.stdout);
-    //output.append(&mut cmd.stderr);
     let termination = match exit_code {
         0 => Termination::Success,
         0xC000013A => Termination::Interrupted,
